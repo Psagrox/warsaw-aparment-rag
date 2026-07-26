@@ -10,6 +10,13 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
+]
+
 
 class NieruchomosciOnlineScraper:
     """Scraper for Nieruchomosci-online.pl (Direct owners / bez pośredników in Warsaw)."""
@@ -17,15 +24,30 @@ class NieruchomosciOnlineScraper:
     def __init__(self) -> None:
         self.base_url: str = "https://www.nieruchomosci-online.pl"
         self.headers: Dict[str, str] = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "pl,en-US;q=0.7,en;q=0.3",
+            "Referer": "https://www.google.com/",
         }
-        self.timeout = httpx.Timeout(8.0, connect=4.0)
+        self.timeout = httpx.Timeout(10.0, connect=5.0)
+
+    def _get_with_backoff(self, url: str, retries: int = 3) -> Optional[httpx.Response]:
+        """Fetch URL with exponential backoff on HTTP 429 (Rate Limit) or connection errors."""
+        for attempt in range(1, retries + 1):
+            headers = self.headers.copy()
+            headers["User-Agent"] = random.choice(USER_AGENTS)
+            try:
+                response = httpx.get(url, headers=headers, timeout=self.timeout, follow_redirects=True)
+                if response.status_code == 429:
+                    wait_time = random.uniform(3.5, 7.0) * attempt
+                    print(f"⚠️ [Nieruchomości-online] HTTP 429 (Rate Limit). Retrying in {wait_time:.1f}s (Attempt {attempt}/{retries})...")
+                    time.sleep(wait_time)
+                    continue
+                return response
+            except Exception as e:
+                logger.debug("Attempt %d failed for %s: %s", attempt, url, str(e))
+                if attempt < retries:
+                    time.sleep(random.uniform(2.0, 4.0))
+        return None
 
     def _parse_rooms(self, raw_rooms: Any) -> Optional[int]:
         if raw_rooms is None:
@@ -118,20 +140,18 @@ class NieruchomosciOnlineScraper:
         else:
             url = f"https://warszawa.nieruchomosci-online.pl/szukaj.html?3,mieszkanie,sprzedaz,,Warszawa&bez-posrednikow=1&p={page}"
 
-        try:
-            response = httpx.get(url, headers=self.headers, timeout=self.timeout, follow_redirects=True)
-            if response.status_code != 200:
-                logger.warning("Nieruchomosci-online search returned HTTP %d", response.status_code)
-                return []
-        except Exception as e:
-            logger.error("Error fetching Nieruchomosci-online search page %d: %s", page, str(e))
+        response = self._get_with_backoff(url)
+        if not response or response.status_code != 200:
+            status_str = f"HTTP {response.status_code}" if response else "Connection Failure"
+            logger.warning("Nieruchomosci-online search page %d failed (%s)", page, status_str)
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
         apartments: List[Dict[str, Any]] = []
+        seen_urls: set[str] = set()
 
         cards = (
-            soup.find_all("div", class_=lambda c: c and "tile" in c.lower() if c else False)
+            soup.find_all("div", class_=lambda c: c and "tile-content" in c.lower() if c else False)
             or soup.find_all("div", class_=lambda c: c and "offer" in c.lower() if c else False)
             or soup.select("div.primary-title, div[data-id]")
         )
@@ -145,9 +165,23 @@ class NieruchomosciOnlineScraper:
             if not offer_url.startswith("http"):
                 offer_url = f"{self.base_url}{offer_url}" if offer_url.startswith("/") else f"https://warszawa.nieruchomosci-online.pl/{offer_url}"
 
+            # Deduplicate by canonical URL
+            clean_url = offer_url.split("?")[0]
+            if clean_url in seen_urls:
+                continue
+            seen_urls.add(clean_url)
+
+            # Canonical offer ID from URL number e.g. /26780870.html -> 26780870
+            id_match = re.search(r"[/,]-?(\d{6,10})\.html", offer_url) or re.search(r"(\d{6,10})", offer_url)
+            offer_id = id_match.group(1) if id_match else str(hash(clean_url))[:8]
+
             title = link.get_text(strip=True) or (card.find("h2").get_text(strip=True) if card.find("h2") else None)
 
-            price_elem = card.find("span", class_=lambda c: c and "price" in c.lower() if c else False) or card.find("p", class_=lambda c: c and "price" in c.lower() if c else False)
+            price_elem = (
+                card.find("span", class_=lambda c: c and "price" in c.lower() if c else False)
+                or card.find("p", class_=lambda c: c and "price" in c.lower() if c else False)
+                or card.find("div", class_=lambda c: c and "price" in c.lower() if c else False)
+            )
             price_val = self._parse_number(price_elem.get_text(strip=True)) if price_elem else None
 
             info_elem = card.find("div", class_=lambda c: c and "info" in c.lower() if c else False) or card
@@ -165,7 +199,6 @@ class NieruchomosciOnlineScraper:
             location_elem = card.find("span", class_=lambda c: c and ("location" in c.lower() or "address" in c.lower()) if c else False)
             district = self._extract_district(location_elem.get_text(strip=True)) if location_elem else None
 
-            # Fallback extraction from card full text and offer URL
             card_full_text = card.get_text(" ", strip=True) + " " + offer_url
             fallbacks = self._extract_fallback_params(card_full_text)
 
@@ -175,11 +208,6 @@ class NieruchomosciOnlineScraper:
 
             if not price_per_sqm and price_val and sqm_val and sqm_val > 0:
                 price_per_sqm = round(price_val / sqm_val, 2)
-
-            offer_id = card.get("data-id") or card.get("id")
-            if not offer_id:
-                id_match = re.search(r",(\d+)\.html", offer_url) or re.search(r"-(\d+)\.html", offer_url)
-                offer_id = id_match.group(1) if id_match else str(hash(offer_url))[:8]
 
             if not title:
                 title = f"Mieszkanie na sprzedaż ({district or 'Warszawa'})"
@@ -198,11 +226,11 @@ class NieruchomosciOnlineScraper:
         return apartments
 
     def get_full_description(self, url: str) -> Optional[str]:
-        try:
-            response = httpx.get(url, headers=self.headers, timeout=self.timeout, follow_redirects=True)
-            if response.status_code != 200:
-                return None
+        response = self._get_with_backoff(url)
+        if not response or response.status_code != 200:
+            return None
 
+        try:
             soup = BeautifulSoup(response.text, "html.parser")
             desc_div = (
                 soup.find("div", class_=lambda c: c and "box-description" in c if c else False)
@@ -228,7 +256,7 @@ class NieruchomosciOnlineScraper:
                 if not apt["price_per_sqm"] and apt["price_pln"] and apt["sqm"]:
                     apt["price_per_sqm"] = round(apt["price_pln"] / apt["sqm"], 2)
 
-            time.sleep(random.uniform(0.8, 1.8))
+            time.sleep(random.uniform(1.2, 2.5))
         else:
             apt["description"] = None
         return apt
@@ -245,7 +273,7 @@ class NieruchomosciOnlineScraper:
             total = len(apartments)
             print(f"  [Nieruchomości-online] Found {total} offers on page {page}. Fetching details safely...")
 
-            with ThreadPoolExecutor(max_workers=3) as executor:
+            with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [
                     executor.submit(self._fetch_details_worker, apt, i + 1, total)
                     for i, apt in enumerate(apartments)

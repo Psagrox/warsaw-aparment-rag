@@ -49,9 +49,9 @@ Stan: gotowe do wprowadzenia, po remoncie. Cicha okolica, blisko stacji metra (M
 """
 
 
-def _get_cache_key(query_text: str, max_price: Any, min_sqm: Any, min_rooms: Any, top_n: Any, only_new: bool, days: int) -> str:
+def _get_cache_key(query_text: str, max_price: Any, min_sqm: Any, min_rooms: Any, top_n: Any, offset: int, only_new: bool, days: int, exclude: Any, include: Any) -> str:
     """Generate a unique hash key for query parameters."""
-    raw = f"{query_text.strip()}|{max_price}|{min_sqm}|{min_rooms}|{top_n}|{only_new}|{days}"
+    raw = f"{query_text.strip()}|{max_price}|{min_sqm}|{min_rooms}|{top_n}|{offset}|{only_new}|{days}|{exclude}|{include}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
@@ -96,12 +96,15 @@ def search_ideal_apartments(
     match_count: int = 500,
     match_threshold: float = 0.10,
     top_n: Optional[int] = 20,
+    offset: int = 0,
     filter_agencies: bool = True,
+    exclude_portals: Optional[List[str]] = None,
+    include_portals: Optional[List[str]] = None,
     only_new: bool = False,
     new_within_days: int = 3,
     use_cache: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Query Supabase vector database across ALL records with support for 'new only' filtering and full lists.
+    """Query Supabase vector database with portal filtering, offset pagination, date filtering, and caching.
 
     Args:
         query_text: Natural language search prompt.
@@ -111,7 +114,10 @@ def search_ideal_apartments(
         match_count: Number of candidate rows to fetch from DB (default 500 for full coverage).
         match_threshold: Cosine similarity threshold (default 0.10).
         top_n: Maximum number of final results to return (None for unlimited).
+        offset: Number of initial records to skip for pagination (e.g. 100).
         filter_agencies: Whether to exclude agency/developer listings.
+        exclude_portals: Optional list of portal names/substrings to exclude (e.g. ['nieruchomosci-online', 'no']).
+        include_portals: Optional list of portal names/substrings to include (e.g. ['otodom', 'olx', 'adresowo']).
         only_new: If True, filters results to apartments added within the last N days.
         new_within_days: Number of days to classify an apartment as 'new' (default 3).
         use_cache: Enable local disk caching for instant repeat queries.
@@ -120,7 +126,7 @@ def search_ideal_apartments(
         List of matching apartment dictionaries.
     """
     prompt = (query_text or DEFAULT_QUERY_TEXT).strip()
-    cache_key = _get_cache_key(prompt, max_price, min_sqm, min_rooms, top_n, only_new, new_within_days)
+    cache_key = _get_cache_key(prompt, max_price, min_sqm, min_rooms, top_n, offset, only_new, new_within_days, exclude_portals, include_portals)
 
     if use_cache:
         cached_results = _read_cache(cache_key)
@@ -173,6 +179,31 @@ def search_ideal_apartments(
     excluded_count = 0
 
     for apt in raw_results:
+        url = (apt.get("url") or "").lower()
+        ext_id = (apt.get("external_id") or "").lower()
+
+        # Determine portal key
+        portal_key = "otodom"
+        if "olx.pl" in url or ext_id.startswith("olx-"):
+            portal_key = "olx"
+        elif "adresowo.pl" in url or ext_id.startswith("adresowo-"):
+            portal_key = "adresowo"
+        elif "nieruchomosci-online.pl" in url or ext_id.startswith("no-"):
+            portal_key = "nieruchomosci-online"
+
+        # Portal exclusion filter
+        if exclude_portals:
+            norm_ex = [ex.lower().replace("_", "-") for ex in exclude_portals]
+            if any(ex in portal_key or ex in url or (ex == "no" and portal_key == "nieruchomosci-online") for ex in norm_ex):
+                continue
+
+        # Portal inclusion filter
+        if include_portals:
+            norm_inc = [inc.lower().replace("_", "-") for inc in include_portals]
+            if not any(inc in portal_key or inc in url or (inc == "no" and portal_key == "nieruchomosci-online") for inc in norm_inc):
+                continue
+
+        # Agency / Developer exclusion filter
         if filter_agencies:
             desc_lower = (apt.get("description") or "").lower()
             title_lower = (apt.get("title") or "").lower()
@@ -210,7 +241,10 @@ def search_ideal_apartments(
         filtered_results = new_only_list
         print(f"🆕 Filtered for NEW apartments added in the last {new_within_days} days. Total new: {len(filtered_results)}.")
 
-    final_results = filtered_results[:top_n] if top_n is not None else filtered_results
+    # Apply Offset and Pagination Slicing
+    start_idx = offset
+    end_idx = (offset + top_n) if top_n is not None else None
+    final_results = filtered_results[start_idx:end_idx]
 
     if use_cache:
         _write_cache(cache_key, final_results)
@@ -218,16 +252,20 @@ def search_ideal_apartments(
     return final_results
 
 
-def generate_markdown_table(apartments: List[Dict[str, Any]], title_label: str = "Matching Apartments") -> str:
-    """Formats apartment search results into a clean Markdown table."""
+def generate_markdown_table(
+    apartments: List[Dict[str, Any]],
+    title_label: str = "Matching Apartments",
+    start_index: int = 1
+) -> str:
+    """Formats apartment search results into a clean Markdown table with custom start index."""
     if not apartments:
         return f"No apartments were found for '{title_label}' strictly meeting all requirements."
 
-    md = f"### 🏡 {title_label} ({len(apartments)} total)\n\n"
+    md = f"### 🏡 {title_label} ({len(apartments)} displayed, items #{start_index} to #{start_index + len(apartments) - 1})\n\n"
     md += "| # | Portal | District | Price (PLN) | Area (m²) | Rooms | Price / m² | Green Infrastructure / Details | Direct Link |\n"
     md += "|---|---|---|---|---|---|---|---|---|\n"
 
-    for idx, apt in enumerate(apartments, start=1):
+    for idx, apt in enumerate(apartments, start=start_index):
         url = apt.get("url", "#")
         portal = "Otodom"
         if "olx.pl" in url:
@@ -265,6 +303,19 @@ def generate_markdown_table(apartments: List[Dict[str, Any]], title_label: str =
 def main() -> None:
     parser = argparse.ArgumentParser(description="Query Agent for Warsaw Apartments RAG Pipeline")
     parser.add_argument(
+        "--exclude-portal",
+        "--exclude",
+        type=str,
+        nargs="+",
+        help="Exclude specific portal(s) e.g. --exclude nieruchomosci-online (or --exclude no)"
+    )
+    parser.add_argument(
+        "--portals",
+        type=str,
+        nargs="+",
+        help="Only search specific portal(s) e.g. --portals otodom olx adresowo"
+    )
+    parser.add_argument(
         "--new",
         action="store_true",
         help="Show ONLY new apartments added recently"
@@ -285,7 +336,19 @@ def main() -> None:
         "--limit",
         type=int,
         default=20,
-        help="Number of results to display (default: 20)"
+        help="Number of results to display per page (default: 20)"
+    )
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Number of initial results to skip (e.g. --offset 100 --limit 100)"
+    )
+    parser.add_argument(
+        "--page",
+        type=int,
+        default=None,
+        help="Page number for pagination (e.g. --page 2 --limit 100)"
     )
     parser.add_argument(
         "--no-cache",
@@ -295,6 +358,10 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    offset = args.offset
+    if args.page is not None and args.page > 1:
+        offset = (args.page - 1) * args.limit
+
     top_limit = None if args.full else args.limit
     use_cache = not args.no_cache
 
@@ -302,11 +369,15 @@ def main() -> None:
         only_new=args.new,
         new_within_days=args.days,
         top_n=top_limit,
+        offset=offset,
+        exclude_portals=args.exclude_portal,
+        include_portals=args.portals,
         use_cache=use_cache
     )
 
-    label = f"NEW Apartments (Last {args.days} Days)" if args.new else ("FULL List of Apartments" if args.full else "Top Matching Apartments")
-    print("\n" + generate_markdown_table(results, title_label=label))
+    label = f"NEW Apartments (Last {args.days} Days)" if args.new else ("FULL List of Apartments" if args.full else "Matching Apartments")
+    start_num = offset + 1
+    print("\n" + generate_markdown_table(results, title_label=label, start_index=start_num))
 
 
 if __name__ == "__main__":

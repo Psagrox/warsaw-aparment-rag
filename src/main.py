@@ -37,14 +37,18 @@ def main() -> None:
         default=1,
         help="Number of search result pages to scrape per portal (default: 1)"
     )
+    parser.add_argument(
+        "--exclude-portal",
+        "--exclude",
+        type=str,
+        nargs="+",
+        help="Exclude specific portal scraper(s) e.g. --exclude nieruchomosci-online (or --exclude no)"
+    )
     args, _ = parser.parse_known_args()
 
     max_pages: int = max(1, args.pages)
 
-    print(f"🚀 Warsaw Apartments RAG ETL Job Starting (Pages per portal: {max_pages}) ...")
-    start_time = time.time()
-
-    # List of configured scrapers for Warsaw real estate portals
+    # Master list of configured scrapers
     scrapers: List[Tuple[str, Any]] = [
         ("Otodom", OtodomScraper()),
         ("OLX", OlxScraper()),
@@ -52,9 +56,25 @@ def main() -> None:
         ("Nieruchomości-online", NieruchomosciOnlineScraper()),
     ]
 
+    # Apply exclusion filter if requested
+    if args.exclude_portal:
+        ex_list = [ex.lower().replace("_", "-") for ex in args.exclude_portal]
+        scrapers = [
+            (name, scraper) for name, scraper in scrapers
+            if not any(
+                ex in name.lower()
+                or (ex == "no" and "nieruchomości" in name.lower())
+                or (ex == "nieruchomosci-online" and "nieruchomości" in name.lower())
+                for ex in ex_list
+            )
+        ]
+
+    print(f"🚀 Warsaw Apartments RAG ETL Job Starting ({len(scrapers)} active scrapers, {max_pages} pages per portal) ...")
+    start_time = time.time()
+
     all_apartments: List[Dict[str, Any]] = []
 
-    # Step 1: Scraping all 4 portals concurrently
+    # Step 1: Scraping selected portals concurrently
     print(f"\nSTEP 1: Concurrently scraping {len(scrapers)} real estate portals...")
 
     with ThreadPoolExecutor(max_workers=len(scrapers)) as executor:
@@ -82,10 +102,10 @@ def main() -> None:
 
     all_apartments = unique_scraped
     total_scraped: int = len(all_apartments)
-    print(f"\nTotal unique scraped apartments across all portals: {total_scraped}")
+    print(f"\nTotal unique scraped apartments across active portals: {total_scraped}")
 
     if not all_apartments:
-        print("No apartments found from any portal. Exiting...")
+        print("No apartments found from selected portals. Exiting...")
         sys.exit(0)
 
     # Step 2: Delta Load check against Supabase
