@@ -1,3 +1,4 @@
+from typing import Any
 import httpx
 import json
 import time
@@ -15,6 +16,34 @@ class OtodomScraper:
         }
         self.base_url = "https://www.otodom.pl"
 
+    def _parse_rooms(self, raw_rooms: Any) -> Optional[int]:
+        """Convert raw rooms data to integer, supporting multiple formats."""
+        ROOM_MAP = {
+            "ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5,
+            "SIX": 6, "SEVEN": 7, "EIGHT": 8, "NINE": 9, "TEN": 10
+        }
+
+        if raw_rooms is None:
+            return None
+
+        # Case 1: Already an integer
+        if isinstance(raw_rooms, int):
+            return raw_rooms
+
+        # Case 2: String representation (e.g. "THREE", "1", "2")
+        s_rooms = str(raw_rooms).strip().upper()
+
+        # Try map first (e.g. "THREE" -> 3)
+        if s_rooms in ROOM_MAP:
+            return ROOM_MAP[s_rooms]
+
+        # Try direct integer conversion
+        try:
+            return int(s_rooms)
+        except (ValueError, TypeError):
+            return None
+
+
     def get_search_results(self, page: int = 1) -> List[Dict]:
         """Obtains metadata from the aparments"""
 
@@ -22,9 +51,9 @@ class OtodomScraper:
         url = f"{self.base_url}/pl/wyniki/sprzedaz/mieszkanie/mazowieckie/warszawa/warszawa/warszawa?page={page}&market=SECONDARY"
 
         try:
-            response = httpx.get(url, headers=self.headers, timeout=15.0)
+            response = httpx.get(url, headers=self.headers, timeout=15.0, follow_redirects=True)
             response.raise_for_status()
-        except httpx.RequestException as e:
+        except httpx.RequestError as e:
             print(f"Error during request to {url}: {e}")
             return []
 
@@ -56,29 +85,32 @@ class OtodomScraper:
                         "price_pln": item.get('totalPrice', {}).get('value'),
                         "price_per_sqm": item.get('pricePerSquareMeter', {}).get('value'),
                         "sqm": item.get('areaInSquareMeters'),
-                        "rooms": item.get('roomsNumber'),
+                        "rooms": self._parse_rooms(item.get('roomsNumber')),
                         "district": item.get('location', {}).get('address', {}).get('district', {}).get('name'),
                         "url": f"{self.base_url}/pl/oferta/{item.get('slug')}"
                     })
         return apartments
         
-    def get_full_description(self, apartment_url: str) -> Optional[Dict]:
-        """Fetches detailed data about a specific apartment from its detail page"""
+    def get_full_description(self, url: str) -> Optional[str]:
+        """Visits the offer page and extracts the full description text."""
         try:
-            response = httpx.get(apartment_url, headers=self.headers, timeout=15.0)
+            response = httpx.get(url, headers=self.headers, timeout=15.0, follow_redirects=True)
+
             if response.status_code != 200:
+                print(f"Otodom block/error: HTTP {response.status_code} at {url}")
                 return None
 
             soup = BeautifulSoup(response.text, "html.parser")
-            #Extrract the container of the description by its atribute data-cy
-            desc_div = soup.find("div", attrs={"data-cy": "adPageAdDescription"})
-            if desc_div:
-                # get_text with separator keeps the paragraphs readable for the embedding
-                return desc_div.get_text(separator="\n", strip=True)
-            return None
+            desc_div = soup.find("div", {"data-cy": "adPageAdDescription"})
 
-        except httpx.RequestException as e:
-            print(f"Error during request to {apartment_url}: {e}")
+            if desc_div:
+                return desc_div.get_text(separator="\n", strip=True)
+            else:
+                print(f"Container 'adPageAdDescription' not found at {url}")
+                return None
+
+        except httpx.RequestError as e:
+            print(f"Error during request to {url}: {e}")
             return None
 
 
