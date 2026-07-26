@@ -80,6 +80,42 @@ class TestSupabaseClientModule(unittest.TestCase):
     """Test suite for src.db.supabase_client SupabaseApartmentClient class."""
 
     @patch("src.db.supabase_client.create_client")
+    def test_get_existing_ids(self, mock_create_client):
+        from src.db.supabase_client import SupabaseApartmentClient
+
+        mock_sb = MagicMock()
+        mock_create_client.return_value = mock_sb
+        mock_table = MagicMock()
+        mock_select = MagicMock()
+        mock_in = MagicMock()
+
+        mock_sb.table.return_value = mock_table
+        mock_table.select.return_value = mock_select
+        mock_select.in_.return_value = mock_in
+
+        mock_response = MagicMock()
+        mock_response.data = [
+            {"external_id": "olx-100"},
+            {"external_id": "adresowo-200"}
+        ]
+        mock_in.execute.return_value = mock_response
+
+        client = SupabaseApartmentClient(
+            supabase_url="https://xyz.supabase.co",
+            supabase_key="service_role_secret",
+            embedder=MagicMock()
+        )
+
+        # Test empty input returns empty set
+        self.assertEqual(client.get_existing_ids([]), set())
+
+        # Test query input
+        existing = client.get_existing_ids(["olx-100", "adresowo-200", "no-300"])
+        self.assertEqual(existing, {"olx-100", "adresowo-200"})
+        mock_sb.table.assert_called_with("apartamentos_varsovia")
+        mock_table.select.assert_called_with("external_id")
+
+    @patch("src.db.supabase_client.create_client")
     def test_upsert_apartments_flow(self, mock_create_client):
         from src.db.supabase_client import SupabaseApartmentClient
 
@@ -130,4 +166,3 @@ class TestSupabaseClientModule(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

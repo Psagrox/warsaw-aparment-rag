@@ -3,6 +3,7 @@ import logging
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from bs4 import BeautifulSoup
 import httpx
@@ -24,9 +25,9 @@ class OlxScraper:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "pl,en-US;q=0.7,en;q=0.3",
         }
+        self.timeout = httpx.Timeout(8.0, connect=4.0)
 
     def _parse_rooms(self, raw_rooms: Any) -> Optional[int]:
-        """Convert raw rooms data to integer, supporting word and string formats."""
         if raw_rooms is None:
             return None
 
@@ -55,7 +56,6 @@ class OlxScraper:
         return None
 
     def _parse_number(self, val: Any) -> Optional[float]:
-        """Clean string and parse float value (e.g. '750 000 zł' or '52,5 m²')."""
         if val is None:
             return None
         if isinstance(val, (int, float)):
@@ -71,7 +71,6 @@ class OlxScraper:
         return None
 
     def _extract_district(self, text: str) -> Optional[str]:
-        """Extract Warsaw district name from location string."""
         if not text:
             return None
         parts = [p.strip() for p in text.split(",")]
@@ -81,21 +80,57 @@ class OlxScraper:
                     return part
         return parts[0] if parts else None
 
+    def _extract_fallback_params(self, text: str) -> Dict[str, Any]:
+        """Extract missing sqm, rooms, or price from title/URL text."""
+        res: Dict[str, Any] = {"sqm": None, "rooms": None, "price_pln": None}
+        if not text:
+            return res
+
+        # Extract sqm e.g. "46.4 m2", "46,4m2"
+        sqm_match = re.search(r"(\d+(?:[\.,]\d+)?)\s*(?:m2|m²|metr)", text, re.IGNORECASE)
+        if sqm_match:
+            try:
+                res["sqm"] = float(sqm_match.group(1).replace(",", "."))
+            except ValueError:
+                pass
+
+        # Extract rooms e.g. "3-pok", "2 pok", "kawalerka"
+        if "kawalerka" in text.lower():
+            res["rooms"] = 1
+        else:
+            rooms_match = re.search(r"(\d+)\s*(?:-| )*(?:pok|pokoj|pokój)", text, re.IGNORECASE)
+            if rooms_match:
+                try:
+                    res["rooms"] = int(rooms_match.group(1))
+                except ValueError:
+                    pass
+
+        # Extract price e.g. "750 000 zł"
+        price_match = re.search(r"(\d[\d\s\xa0\.]*)\s*(?:zł|PLN)", text, re.IGNORECASE)
+        if price_match:
+            raw_price = price_match.group(1).replace(" ", "").replace("\xa0", "").replace(".", "")
+            try:
+                res["price_pln"] = float(raw_price)
+            except ValueError:
+                pass
+
+        return res
+
     def get_search_results(self, page: int = 1) -> List[Dict[str, Any]]:
-        """Fetch search results for private business apartment offers in Warsaw."""
         url = f"{self.base_url}/nieruchomosci/mieszkania/sprzedaz/warszawa/?page={page}&search[private_business]=private"
 
         try:
-            response = httpx.get(url, headers=self.headers, timeout=15.0, follow_redirects=True)
-            response.raise_for_status()
-        except httpx.RequestError as e:
+            response = httpx.get(url, headers=self.headers, timeout=self.timeout, follow_redirects=True)
+            if response.status_code != 200:
+                logger.warning("OLX search returned HTTP %d", response.status_code)
+                return []
+        except Exception as e:
             logger.error("Error fetching OLX search page %d: %s", page, str(e))
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
         apartments: List[Dict[str, Any]] = []
 
-        # Attempt to parse via NEXT_DATA JSON script tag if available
         script_data = soup.find("script", id="__NEXT_DATA__")
         if script_data and script_data.string:
             try:
@@ -108,26 +143,37 @@ class OlxScraper:
                             continue
                         price_val = self._parse_number(ad.get("params", {}).get("price", {}).get("value"))
                         sqm_val = self._parse_number(ad.get("params", {}).get("m", {}).get("value"))
+                        rooms_val = self._parse_rooms(ad.get("params", {}).get("rooms", {}).get("value"))
+
+                        district_name = self._extract_district(ad.get("location", {}).get("city_name", ""))
+                        title_str = ad.get("title") or f"Mieszkanie na sprzedaż ({district_name or 'Warszawa'})"
+                        offer_url = ad.get("url") if ad.get("url", "").startswith("http") else f"{self.base_url}{ad.get('url', '')}"
+
+                        # Fallback parsing from title/url text if fields are missing
+                        fallbacks = self._extract_fallback_params(f"{title_str} {offer_url}")
+                        sqm_val = sqm_val or fallbacks["sqm"]
+                        rooms_val = rooms_val or fallbacks["rooms"]
+                        price_val = price_val or fallbacks["price_pln"]
+
                         price_per_sqm = None
                         if price_val and sqm_val and sqm_val > 0:
                             price_per_sqm = round(price_val / sqm_val, 2)
 
                         apartments.append({
                             "external_id": f"olx-{ad_id}",
-                            "title": ad.get("title"),
+                            "title": title_str,
                             "price_pln": price_val,
                             "price_per_sqm": price_per_sqm,
                             "sqm": sqm_val,
-                            "rooms": self._parse_rooms(ad.get("params", {}).get("rooms", {}).get("value")),
-                            "district": self._extract_district(ad.get("location", {}).get("city_name", "")),
-                            "url": ad.get("url") if ad.get("url", "").startswith("http") else f"{self.base_url}{ad.get('url', '')}",
+                            "rooms": rooms_val,
+                            "district": district_name,
+                            "url": offer_url,
                         })
                     if apartments:
                         return apartments
-            except (json.JSONDecodeError, KeyError, TypeError) as e:
+            except Exception as e:
                 logger.debug("Failed parsing NEXT_DATA JSON from OLX: %s", str(e))
 
-        # Fallback HTML scraping
         cards = soup.find_all("div", {"data-cy": "l-card"}) or soup.find_all("div", {"data-testid": "listing-grid"})
         if not cards:
             cards = soup.select("a[href*='/d/oferta/']")
@@ -141,86 +187,104 @@ class OlxScraper:
             if not offer_url.startswith("http"):
                 offer_url = f"{self.base_url}{offer_url}"
 
-            title_elem = card.find("h6") or card.find("h3") or card.find("strong")
+            title_elem = card.find("h6") or card.find("h3") or card.find("strong") or card.find("h2")
             title = title_elem.get_text(strip=True) if title_elem else None
 
             price_elem = card.find("p", {"data-testid": "ad-price"}) or card.find("p", class_=lambda c: c and "price" in c.lower() if c else False)
             price_val = self._parse_number(price_elem.get_text(strip=True)) if price_elem else None
 
-            # Extract ad ID from card or URL
             id_match = re.search(r"ID([a-zA-Z0-9]+)", offer_url) or re.search(r"-ID(\d+)", offer_url)
             ad_id = id_match.group(1) if id_match else str(hash(offer_url))[:8]
 
             location_elem = card.find("p", {"data-testid": "location-date"})
             location_text = location_elem.get_text(strip=True) if location_elem else ""
+            district = self._extract_district(location_text)
+
+            card_full_text = card.get_text(" ", strip=True) + " " + offer_url
+            fallbacks = self._extract_fallback_params(card_full_text)
+
+            price_val = price_val or fallbacks["price_pln"]
+            sqm_val = fallbacks["sqm"]
+            rooms_val = fallbacks["rooms"]
+
+            if not title:
+                title = f"Mieszkanie na sprzedaż ({district or 'Warszawa'})"
+
+            price_per_sqm = None
+            if price_val and sqm_val and sqm_val > 0:
+                price_per_sqm = round(price_val / sqm_val, 2)
 
             apartments.append({
                 "external_id": f"olx-{ad_id}",
                 "title": title,
                 "price_pln": price_val,
-                "price_per_sqm": None,
-                "sqm": None,
-                "rooms": None,
-                "district": self._extract_district(location_text),
+                "price_per_sqm": price_per_sqm,
+                "sqm": sqm_val,
+                "rooms": rooms_val,
+                "district": district,
                 "url": offer_url,
             })
 
         return apartments
 
     def get_full_description(self, url: str) -> Optional[str]:
-        """Fetch the offer page and extract the full description text.
-
-        Returns None if request fails (HTTP 403/404 or RequestError).
-        """
         try:
-            response = httpx.get(url, headers=self.headers, timeout=15.0, follow_redirects=True)
+            response = httpx.get(url, headers=self.headers, timeout=self.timeout, follow_redirects=True)
             if response.status_code != 200:
-                logger.warning("OLX request failed with HTTP %d for URL: %s", response.status_code, url)
                 return None
 
             soup = BeautifulSoup(response.text, "html.parser")
-
             desc_div = (
                 soup.find("div", {"data-cy": "ad_description"})
                 or soup.find("div", {"data-testid": "ad_description"})
                 or soup.find("div", class_=lambda c: c and "css-1m8mzw3" in c if c else False)
             )
-
-            if desc_div:
-                return desc_div.get_text(separator="\n", strip=True)
+            return desc_div.get_text(separator="\n", strip=True) if desc_div else None
+        except Exception:
             return None
 
-        except httpx.RequestError as e:
-            logger.error("HTTP request error for %s: %s", url, str(e))
-            return None
+    def _fetch_details_worker(self, apt: Dict[str, Any], idx: int, total: int) -> Dict[str, Any]:
+        url = apt.get("url", "")
+        if url:
+            print(f"  [OLX] ({idx}/{total}) Fetching details...")
+            apt["description"] = self.get_full_description(url)
+
+            # Extra parameter extraction from description text if sqm or rooms were missing
+            if apt["description"]:
+                extra = self._extract_fallback_params(apt["description"])
+                apt["sqm"] = apt["sqm"] or extra["sqm"]
+                apt["rooms"] = apt["rooms"] or extra["rooms"]
+                apt["price_pln"] = apt["price_pln"] or extra["price_pln"]
+                if not apt["price_per_sqm"] and apt["price_pln"] and apt["sqm"]:
+                    apt["price_per_sqm"] = round(apt["price_pln"] / apt["sqm"], 2)
+
+            time.sleep(random.uniform(0.8, 1.8))
+        else:
+            apt["description"] = None
+        return apt
 
     def run(self, max_pages: int = 1) -> List[Dict[str, Any]]:
-        """Orchestrate extraction over max_pages fetching full descriptions."""
-        logger.info("Starting OLX scraper for Warsaw (Private Business filter)...")
+        logger.info("Starting OLX scraper for Warsaw...")
         all_apartments: List[Dict[str, Any]] = []
 
         for page in range(1, max_pages + 1):
-            logger.info("Fetching OLX search page %d...", page)
             apartments = self.get_search_results(page)
-
             if not apartments:
-                logger.info("No offers found on page %d. Ending scrape.", page)
                 break
 
-            for apt in apartments:
-                logger.info("Fetching details for: %s", apt["url"])
-                description = self.get_full_description(apt["url"])
-                apt["description"] = description
-                all_apartments.append(apt)
+            total = len(apartments)
+            print(f"  [OLX] Found {total} offers on page {page}. Fetching details safely...")
 
-                # Rate limiting delay
-                time.sleep(random.uniform(1.5, 3.5))
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                futures = [
+                    executor.submit(self._fetch_details_worker, apt, i + 1, total)
+                    for i, apt in enumerate(apartments)
+                ]
+                for future in as_completed(futures):
+                    try:
+                        all_apartments.append(future.result())
+                    except Exception as e:
+                        logger.error("Error processing OLX offer: %s", str(e))
 
-        logger.info("OLX scraping complete. Retrieved %d offers.", len(all_apartments))
+        logger.info("OLX scraping complete. Total: %d", len(all_apartments))
         return all_apartments
-
-
-if __name__ == "__main__":
-    scraper = OlxScraper()
-    data = scraper.run(max_pages=1)
-    print(json.dumps(data, indent=2, ensure_ascii=False))

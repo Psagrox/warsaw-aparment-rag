@@ -44,7 +44,7 @@ class EmbeddingGenerator:
             OpenAIError: If the OpenAI API call fails.
         """
         if text is None or not text.strip():
-            logger.warning("Empty or None text provided for embedding. Returning zero vector.")
+            logger.debug("Empty or None text provided for embedding. Returning zero vector.")
             return [0.0] * self.VECTOR_DIMENSION
 
         try:
