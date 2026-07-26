@@ -63,14 +63,10 @@ class SupabaseApartmentClient:
         for index, apartment in enumerate(apartments_list):
             try:
                 record = apartment.copy()
-                title = record.get("title") or ""
-                district = record.get("district") or ""
-                description = record.get("description") or ""
+                description = record.get("description")
 
-                text_to_embed = f"{title}\n{district}\n{description}".strip()
-
-                # Generate 1536-dimensional vector for apartment data
-                record["embedding"] = self.embedder.generate_embedding(text_to_embed)
+                # Generate 1536-dimensional vector for apartment description
+                record["embedding"] = self.embedder.generate_embedding(description)
                 records_to_upsert.append(record)
             except Exception as e:
                 ext_id = apartment.get("external_id", f"index_{index}")

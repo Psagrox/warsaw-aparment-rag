@@ -43,6 +43,26 @@ class OtodomScraper:
         except (ValueError, TypeError):
             return None
 
+    def _parse_district(self, location_data: Optional[Dict]) -> Optional[str]:
+        """Extracts district name from reverseGeocoding or address data."""
+        if not location_data or not isinstance(location_data, dict):
+            return None
+
+        # Method 1: Check reverseGeocoding locations list for locationLevel == 'district'
+        locations = location_data.get("reverseGeocoding", {}).get("locations", [])
+        for loc in locations:
+            if isinstance(loc, dict) and loc.get("locationLevel") == "district":
+                return loc.get("name")
+
+        # Method 2: Fallback to direct address district field
+        address = location_data.get("address", {})
+        if isinstance(address, dict):
+            district = address.get("district")
+            if isinstance(district, dict):
+                return district.get("name")
+
+        return None
+
 
     def get_search_results(self, page: int = 1) -> List[Dict]:
         """Obtains metadata from the aparments"""
@@ -86,7 +106,7 @@ class OtodomScraper:
                         "price_per_sqm": item.get('pricePerSquareMeter', {}).get('value'),
                         "sqm": item.get('areaInSquareMeters'),
                         "rooms": self._parse_rooms(item.get('roomsNumber')),
-                        "district": item.get('location', {}).get('address', {}).get('district', {}).get('name'),
+                        "district": self._parse_district(item.get('location')),
                         "url": f"{self.base_url}/pl/oferta/{item.get('slug')}"
                     })
         return apartments

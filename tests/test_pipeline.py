@@ -15,10 +15,9 @@ class TestConfigModule(unittest.TestCase):
 
     @patch.dict(os.environ, {}, clear=True)
     def test_missing_env_vars_raises_value_error(self):
+        from src.config import _get_required_env_var
         with self.assertRaises(ValueError) as ctx:
-            import importlib
-            import src.config
-            importlib.reload(src.config)
+            _get_required_env_var("NON_EXISTENT_VAR")
         self.assertIn("Missing required environment variable", str(ctx.exception))
 
     @patch.dict(os.environ, {
