@@ -3,10 +3,11 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 from openai import OpenAI
 from supabase import Client, create_client
@@ -21,6 +22,80 @@ load_dotenv()
 # Disk cache directory
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", ".cache")
 CACHE_FILE = os.path.join(CACHE_DIR, "query_agent_cache.json")
+
+MONTH_MAP = {
+    "stycznia": "01", "stycznie": "01", "styczeń": "01", "sty": "01",
+    "lutego": "02", "luty": "02", "lut": "02",
+    "marca": "03", "marzec": "03", "mar": "03",
+    "kwietnia": "04", "kwiecień": "04", "kwi": "04",
+    "maja": "05", "maj": "05",
+    "czerwca": "06", "czerwiec": "06", "cze": "06",
+    "lipca": "07", "lipiec": "07", "lip": "07",
+    "sierpnia": "08", "sierpień": "08", "sie": "08",
+    "września": "09", "wrzesień": "09", "wrz": "09",
+    "października": "10", "październik": "10", "paź": "10",
+    "listopada": "11", "listopad": "11", "lis": "11",
+    "grudnia": "12", "grudzień": "12", "gru": "12",
+}
+
+
+def parse_date_to_iso(raw: Optional[str]) -> str:
+    """Converts raw date strings or timestamps into clean YYYY-MM-DD format."""
+    if not raw or raw == "N/A":
+        return "N/A"
+
+    raw_clean = str(raw).strip()
+
+    # Polish text date e.g. "02 lipca 2026"
+    text_match = re.search(r"(\d{1,2})\s+([a-zA-ZzłóśćążęńZŁÓŚĆĄŻĘŃ]+)\s+(\d{4})", raw_clean)
+    if text_match:
+        day = text_match.group(1).zfill(2)
+        month_word = text_match.group(2).lower()
+        year = text_match.group(3)
+        month_code = MONTH_MAP.get(month_word)
+        if month_code:
+            return f"{year}-{month_code}-{day}"
+
+    # DD.MM.YYYY
+    dot_match = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", raw_clean)
+    if dot_match:
+        d, m, y = dot_match.group(1).zfill(2), dot_match.group(2).zfill(2), dot_match.group(3)
+        return f"{y}-{m}-{d}"
+
+    # ISO format YYYY-MM-DD
+    iso_match = re.search(r"(\d{4})-(\d{2})-(\d{2})", raw_clean)
+    if iso_match:
+        return f"{iso_match.group(1)}-{iso_match.group(2)}-{iso_match.group(3)}"
+
+    # "Dzisiaj" / "Today"
+    if "dzisiaj" in raw_clean.lower() or "today" in raw_clean.lower():
+        return datetime.now().strftime("%Y-%m-%d")
+
+    # "Wczoraj" / "Yesterday"
+    if "wczoraj" in raw_clean.lower() or "yesterday" in raw_clean.lower():
+        return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    return raw_clean[:10]
+
+
+def extract_clean_district_and_date(apt: Dict[str, Any]) -> Tuple[str, str]:
+    """Extracts clean district name and parsed YYYY-MM-DD post date."""
+    district_raw = apt.get("district") or "N/A"
+    raw_date = apt.get("date_posted") or apt.get("date") or ""
+
+    clean_district = district_raw
+    if "-" in district_raw:
+        parts = district_raw.split("-", 1)
+        if re.search(r"(\d{1,2}\s+[a-zA-ZzłóśćążęńZŁÓŚĆĄŻĘŃ]+\s+\d{4}|\d{1,2}\.\d{1,2}\.\d{4})", parts[1]):
+            clean_district = parts[0].strip()
+            if not raw_date or raw_date == "N/A":
+                raw_date = parts[1].strip()
+
+    if not raw_date or raw_date == "N/A":
+        raw_date = apt.get("created_at") or apt.get("updated_at") or ""
+
+    parsed_date = parse_date_to_iso(raw_date)
+    return clean_district, parsed_date
 
 
 def get_supabase_client() -> Client:
@@ -164,6 +239,20 @@ def search_ideal_apartments(
 
     print(f"🔍 Retrieved {len(raw_results)} candidate records from Supabase.")
 
+    # Enrich Supabase RPC records with created_at / updated_at timestamps from database table
+    all_ids = [apt["id"] for apt in raw_results if apt.get("id")]
+    if all_ids:
+        try:
+            date_lookup = supabase.table("apartamentos_varsovia").select("id, created_at, updated_at").in_("id", all_ids).execute()
+            date_map = {r["id"]: r for r in (date_lookup.data or [])}
+            for apt in raw_results:
+                info = date_map.get(apt.get("id"))
+                if info:
+                    apt["created_at"] = info.get("created_at")
+                    apt["updated_at"] = info.get("updated_at")
+        except Exception as e:
+            logger.debug("Notice: timestamp lookup error: %s", str(e))
+
     filtered_results: List[Dict[str, Any]] = []
     excluded_agencies_count = 0
     excluded_districts_count = 0
@@ -198,6 +287,8 @@ def search_ideal_apartments(
             portal_key = "nieruchomosci-online"
         elif "morizon.pl" in url or ext_id.startswith("morizon-"):
             portal_key = "morizon"
+        elif "freedom.pl" in url or ext_id.startswith("freedom-"):
+            portal_key = "freedom"
 
         # Portal exclusion filter
         if exclude_portals:
@@ -240,11 +331,11 @@ def search_ideal_apartments(
         cutoff_date = datetime.now(timezone.utc) - timedelta(days=new_within_days)
         new_only_list: List[Dict[str, Any]] = []
         for apt in filtered_results:
-            created_str = apt.get("created_at") or apt.get("updated_at")
-            if created_str:
+            _, date_iso = extract_clean_district_and_date(apt)
+            if date_iso and date_iso != "N/A":
                 try:
-                    created_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
-                    if created_dt >= cutoff_date:
+                    dt = datetime.strptime(date_iso, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                    if dt >= cutoff_date:
                         new_only_list.append(apt)
                 except Exception:
                     new_only_list.append(apt)
@@ -288,17 +379,11 @@ def generate_markdown_table(
             portal = "Nieruchomości-online"
         elif "morizon.pl" in url:
             portal = "Morizon"
+        elif "freedom.pl" in url:
+            portal = "Freedom"
 
-        # Format creation date as YYYY-MM-DD
-        raw_date = apt.get("created_at") or apt.get("updated_at") or ""
-        date_str = "N/A"
-        if raw_date:
-            try:
-                date_str = str(raw_date).split("T")[0]
-            except Exception:
-                date_str = str(raw_date)[:10]
+        district, date_str = extract_clean_district_and_date(apt)
 
-        district = apt.get("district") or "N/A"
         price_val = apt.get("price_pln")
         sqm_val = apt.get("sqm")
         price_sqm_val = apt.get("price_per_sqm")
@@ -349,13 +434,13 @@ def main() -> None:
         "--exclude",
         type=str,
         nargs="+",
-        help="Exclude specific portal(s) e.g. --exclude nieruchomosci-online morizon"
+        help="Exclude specific portal(s) e.g. --exclude nieruchomosci-online morizon freedom"
     )
     parser.add_argument(
         "--portals",
         type=str,
         nargs="+",
-        help="Only search specific portal(s) e.g. --portals otodom olx adresowo morizon"
+        help="Only search specific portal(s) e.g. --portals otodom olx adresowo morizon freedom"
     )
     parser.add_argument(
         "--new",

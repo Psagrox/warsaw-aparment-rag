@@ -4,12 +4,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Set, Tuple
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
 # Import config to fail-fast if environment variables are missing
 import src.config
 
 from src.db.supabase_client import SupabaseApartmentClient
 from src.scraper import (
     AdresowoScraper,
+    FreedomScraper,
     MorizonScraper,
     NieruchomosciOnlineScraper,
     OlxScraper,
@@ -43,7 +47,13 @@ def main() -> None:
         "--exclude",
         type=str,
         nargs="+",
-        help="Exclude specific portal scraper(s) e.g. --exclude morizon (or --exclude no)"
+        help="Exclude specific portal scraper(s) e.g. --exclude morizon freedom"
+    )
+    parser.add_argument(
+        "--portals",
+        type=str,
+        nargs="+",
+        help="Only search specific portal(s) e.g. --portals otodom freedom"
     )
     args, _ = parser.parse_known_args()
 
@@ -56,7 +66,21 @@ def main() -> None:
         ("Adresowo", AdresowoScraper()),
         ("Nieruchomości-online", NieruchomosciOnlineScraper()),
         ("Morizon", MorizonScraper()),
+        ("Freedom", FreedomScraper()),
     ]
+
+    # Apply portal inclusion filter if requested
+    if args.portals:
+        inc_list = [inc.lower().replace("_", "-") for inc in args.portals]
+        scrapers = [
+            (name, scraper) for name, scraper in scrapers
+            if any(
+                inc in name.lower()
+                or (inc == "no" and "nieruchomości" in name.lower())
+                or (inc == "nieruchomosci-online" and "nieruchomości" in name.lower())
+                for inc in inc_list
+            )
+        ]
 
     # Apply exclusion filter if requested
     if args.exclude_portal:

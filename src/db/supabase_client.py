@@ -165,6 +165,9 @@ class SupabaseApartmentClient:
                 else:
                     text_to_embed = str(description).strip()
 
+                # Pop non-column transient fields before sending to Supabase PostgREST
+                record.pop("date_posted", None)
+
                 record["embedding"] = self.embedder.generate_embedding(text_to_embed)
                 records_to_upsert.append(record)
             except Exception as e:

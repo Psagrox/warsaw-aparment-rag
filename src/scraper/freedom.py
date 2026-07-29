@@ -33,13 +33,6 @@ MONTH_MAP = {
     "grudnia": "12", "grudzień": "12", "gru": "12",
 }
 
-ROOM_MAP: Dict[str, int] = {
-    "ONE": 1, "TWO": 2, "THREE": 3, "FOUR": 4, "FIVE": 5,
-    "SIX": 6, "SEVEN": 7, "EIGHT": 8, "NINE": 9, "TEN": 10,
-    "KAWALERKA": 1, "1 POKÓJ": 1, "2 POKOJE": 2, "3 POKOJE": 3,
-    "4 POKOJE": 4, "5 POKOI": 5, "1": 1, "2": 2, "3": 3, "4": 4, "5": 5,
-}
-
 
 def parse_date_to_iso(raw: str) -> Optional[str]:
     """Converts various date strings into YYYY-MM-DD format."""
@@ -80,63 +73,49 @@ def parse_date_to_iso(raw: str) -> Optional[str]:
     return None
 
 
-class MorizonScraper:
-    """Scraper for Morizon.pl real estate apartment offers in Warsaw."""
+class FreedomScraper:
+    """Scraper for Freedom.pl (Freedom Nieruchomości) real estate apartment offers in Warsaw."""
 
     def __init__(self) -> None:
-        self.base_url: str = "https://www.morizon.pl"
+        self.base_url: str = "https://freedom.pl"
         self.headers: Dict[str, str] = {
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "pl,en-US;q=0.7,en;q=0.3",
-            "Referer": "https://www.google.com/",
+            "Referer": "https://freedom.pl/",
         }
         self.timeout = httpx.Timeout(10.0, connect=5.0)
 
     def _get_with_backoff(self, url: str, retries: int = 3) -> Optional[httpx.Response]:
-        """Fetch URL with exponential backoff on HTTP 429 (Rate Limit) or connection errors."""
+        """Fetch URL with exponential backoff on HTTP 429 or connection errors."""
         for attempt in range(1, retries + 1):
             headers = self.headers.copy()
             headers["User-Agent"] = random.choice(USER_AGENTS)
             try:
                 response = httpx.get(url, headers=headers, timeout=self.timeout, follow_redirects=True)
                 if response.status_code == 429:
-                    wait_time = random.uniform(3.5, 7.0) * attempt
-                    print(f"⚠️ [Morizon] HTTP 429 (Rate Limit). Retrying in {wait_time:.1f}s (Attempt {attempt}/{retries})...")
+                    wait_time = random.uniform(3.0, 6.0) * attempt
+                    print(f"⚠️ [Freedom] HTTP 429 (Rate Limit). Retrying in {wait_time:.1f}s (Attempt {attempt}/{retries})...")
                     time.sleep(wait_time)
                     continue
                 return response
             except Exception as e:
                 logger.debug("Attempt %d failed for %s: %s", attempt, url, str(e))
                 if attempt < retries:
-                    time.sleep(random.uniform(2.0, 4.0))
+                    time.sleep(random.uniform(1.5, 3.0))
         return None
 
     def _extract_district(self, text: str) -> Optional[str]:
         if not text:
             return None
         parts = [p.strip() for p in text.split(",") if p.strip()]
-        for p in reversed(parts):
-            if p.lower() not in ["warszawa", "mazowieckie"]:
-                return p.title()
+        for p in parts:
+            p_clean = p.lower()
+            if p_clean not in ["warszawa", "mazowieckie"] and not p_clean.startswith("ul."):
+                return p.capitalize()
         return parts[0] if parts else None
 
-    def _parse_rooms(self, rooms_txt: str) -> Optional[int]:
-        """Parse room count using ROOM_MAP or numeric regex."""
-        if not rooms_txt:
-            return None
-        cleaned = rooms_txt.strip().upper()
-        if cleaned in ROOM_MAP:
-            return ROOM_MAP[cleaned]
-        r_match = re.search(r"(\d+)", cleaned)
-        if r_match:
-            try:
-                return int(r_match.group(1))
-            except ValueError:
-                pass
-        return None
-
     def _extract_fallback_params(self, text: str, url: str = "") -> Dict[str, Any]:
-        """Extract missing sqm, rooms, district, or price from title/URL text."""
+        """Extract missing sqm, rooms, district, or price from text/URL."""
         res: Dict[str, Any] = {"sqm": None, "rooms": None, "price_pln": None, "district": None, "date_posted": None}
         if not text and not url:
             return res
@@ -171,8 +150,8 @@ class MorizonScraper:
             except ValueError:
                 pass
 
-        # Extract date e.g. "Data dodania 25.05.2026" or "Aktualizacja 27.07.2026"
-        date_match = re.search(r"(?:Data dodania|Aktualizacja|Dodano)\s*:?\s*(\d{1,2}\.\d{1,2}\.\d{4})", text, re.IGNORECASE)
+        # Extract date e.g. "Opublikowano: 27.07.2026" or "Dodano 17.07.2026"
+        date_match = re.search(r"(?:Opublikowano|Dodano|Aktualizacja)\s*:?\s*(\d{1,2}\.\d{1,2}\.\d{4})", text, re.IGNORECASE)
         if date_match:
             res["date_posted"] = parse_date_to_iso(date_match.group(1))
 
@@ -180,24 +159,24 @@ class MorizonScraper:
 
     def get_search_results(self, page: int = 1) -> List[Dict[str, Any]]:
         if page == 1:
-            url = f"{self.base_url}/mieszkania/warszawa/"
+            url = f"{self.base_url}/mieszkania/Warszawa/mz/"
         else:
-            url = f"{self.base_url}/mieszkania/warszawa/?page={page}"
+            url = f"{self.base_url}/mieszkania/Warszawa/mz/page/{page}/"
 
         response = self._get_with_backoff(url)
         if not response or response.status_code != 200:
             status_str = f"HTTP {response.status_code}" if response else "Connection Failure"
-            logger.warning("Morizon search page %d failed (%s)", page, status_str)
+            logger.warning("Freedom search page %d failed (%s)", page, status_str)
             return []
 
         soup = BeautifulSoup(response.text, "html.parser")
         apartments: List[Dict[str, Any]] = []
         seen_urls: set[str] = set()
 
-        cards = soup.select("div.card__outer") or soup.find_all("div", class_=lambda c: c and "card__outer" in c if c else False)
+        cards = soup.select("div.offert") or soup.find_all("div", class_=lambda c: c and "offert" in c if c else False)
 
         for card in cards:
-            link = card.select_one("a.property-card[href]") or card.find("a", href=lambda h: h and "/oferta/" in h)
+            link = card.select_one("a.offert-box-ctn-link[href]") or card.find("a", href=lambda h: h and "/oferta/" in h)
             if not link or not link.get("href"):
                 continue
 
@@ -211,53 +190,52 @@ class MorizonScraper:
 
             # Canonical offer ID
             id_match = (
-                re.search(r"-(mzn\d+|mzn-[a-zA-Z0-9]+|\d+)$", clean_url)
-                or re.search(r"-(mzn[a-zA-Z0-9]+)$", clean_url)
-                or re.search(r"(\d{6,12})", clean_url)
+                re.search(r"-(\d+-\d+-[a-z]+)/?$", clean_url)
+                or re.search(r"-(\d+)/?$", clean_url)
+                or re.search(r"(\d{5,10})", clean_url)
             )
             offer_id = id_match.group(1) if id_match else str(hash(clean_url))[:8]
 
-            title_elem = card.find(attrs={"data-cy": "propertyCardTitle"})
-            title = title_elem.get_text(strip=True) if title_elem else "Mieszkanie na sprzedaż (Warszawa)"
+            addr_elem = card.find("address")
+            addr_txt = addr_elem.get_text(strip=True) if addr_elem else ""
+            district = self._extract_district(addr_txt)
 
-            loc_elem = card.find(attrs={"data-cy": "propertyCardLocation"})
-            loc_text = loc_elem.get_text(strip=True) if loc_elem else ""
-
-            price_elem = card.find(attrs={"data-cy": "propertyCardPrice"})
+            price_elem = card.select_one("div.price strong")
             price_txt = price_elem.get_text(strip=True) if price_elem else ""
             p_match = re.search(r"(\d[\d\s\xa0\.]*)\s*zł", price_txt)
             price_val = float(p_match.group(1).replace(" ", "").replace("\xa0", "").replace(".", "")) if p_match else None
 
-            price_m2_elem = card.find(attrs={"data-cy": "offerPricePerM2"})
-            price_m2_txt = price_m2_elem.get_text(strip=True) if price_m2_elem else ""
-            pm2_match = re.search(r"(\d[\d\s\xa0\.]*)\s*zł", price_m2_txt)
-            price_per_sqm = float(pm2_match.group(1).replace(" ", "").replace("\xa0", "").replace(".", "")) if pm2_match else None
+            pm2_elem = card.select_one("div.price p strong")
+            pm2_txt = pm2_elem.get_text(strip=True) if pm2_elem else ""
+            pm2_match = re.search(r"(\d[\d\s\xa0\.]*)", pm2_txt)
+            price_per_sqm = float(pm2_match.group(1).replace(" ", "").replace("\xa0", "").replace(",", ".")) if pm2_match else None
 
-            area_elem = card.find(attrs={"data-cy": "cardPropertyInfoArea"})
-            area_txt = area_elem.get_text(strip=True) if area_elem else ""
-            s_match = re.search(r"(\d+(?:[\.,]\d+)?)", area_txt)
+            details_str = " ".join([s.get_text(strip=True) for s in card.select("div.details strong")])
+            s_match = re.search(r"(\d+(?:[\.,]\d+)?)\s*m", details_str)
             sqm_val = float(s_match.group(1).replace(",", ".")) if s_match else None
 
-            rooms_elem = card.find(attrs={"data-cy": "cardPropertyInfoRooms"})
-            rooms_txt = rooms_elem.get_text(strip=True) if rooms_elem else ""
-            rooms_val = self._parse_rooms(rooms_txt)
+            r_match = re.search(r"(\d+)\s*pok", details_str, re.IGNORECASE)
+            rooms_val = int(r_match.group(1)) if r_match else None
 
-            district = self._extract_district(loc_text)
+            date_elem = card.select_one("div.bottom small")
+            date_txt = date_elem.get_text(strip=True) if date_elem else ""
+            date_posted = parse_date_to_iso(date_txt)
 
             fallbacks = self._extract_fallback_params(card.get_text(" ", strip=True), clean_url)
             price_val = price_val or fallbacks["price_pln"]
             sqm_val = sqm_val or fallbacks["sqm"]
             rooms_val = rooms_val or fallbacks["rooms"]
             district = district or fallbacks["district"]
-            date_posted = fallbacks.get("date_posted")
+            date_posted = date_posted or fallbacks.get("date_posted")
 
             if not price_per_sqm and price_val and sqm_val and sqm_val > 0:
                 price_per_sqm = round(price_val / sqm_val, 2)
 
             stored_district = f"{district} - {date_posted}" if date_posted and district else (district or "Warszawa")
+            title = f"Mieszkanie Warszawa ({district or 'Warszawa'})"
 
             apartments.append({
-                "external_id": f"morizon-{offer_id}",
+                "external_id": f"freedom-{offer_id}",
                 "title": title,
                 "price_pln": price_val,
                 "price_per_sqm": price_per_sqm,
@@ -271,7 +249,7 @@ class MorizonScraper:
         return apartments
 
     def get_full_description(self, url: str) -> Tuple[Optional[str], Dict[str, Any]]:
-        """Fetch full description from Morizon detail page."""
+        """Fetch description text and metadata from Freedom.pl detail page."""
         response = self._get_with_backoff(url)
         meta: Dict[str, Any] = {}
         if not response or response.status_code != 200:
@@ -282,12 +260,15 @@ class MorizonScraper:
             page_text = soup.get_text(" ", strip=True)
             meta = self._extract_fallback_params(page_text, url)
 
-            desc_div = (
-                soup.find("div", class_=lambda c: c and "details-description" in c if c else False)
-                or soup.find("div", attrs={"data-cy": "offerDescription"})
-                or soup.find("div", class_=lambda c: c and "description" in c.lower() if c else False)
-            )
-            desc_text = desc_div.get_text(separator="\n", strip=True) if desc_div else None
+            article = soup.find("div", class_="left-page") or soup.find("div", class_="article-page")
+            if article:
+                ps = article.find_all("p")
+                paragraphs = [p.get_text(strip=True) for p in ps if len(p.get_text(strip=True)) > 20]
+                if paragraphs:
+                    return "\n\n".join(paragraphs), meta
+            
+            main_desc = soup.find("div", class_=lambda c: c and "description" in c.lower() if c else False)
+            desc_text = main_desc.get_text(separator="\n", strip=True) if main_desc else None
             return desc_text, meta
         except Exception:
             return None, meta
@@ -295,7 +276,7 @@ class MorizonScraper:
     def _fetch_details_worker(self, apt: Dict[str, Any], idx: int, total: int) -> Dict[str, Any]:
         url = apt.get("url", "")
         if url:
-            print(f"  [Morizon] ({idx}/{total}) Fetching details...")
+            print(f"  [Freedom] ({idx}/{total}) Fetching details...")
             desc_text, meta = self.get_full_description(url)
             apt["description"] = desc_text
 
@@ -312,13 +293,13 @@ class MorizonScraper:
             if not apt["price_per_sqm"] and apt["price_pln"] and apt["sqm"]:
                 apt["price_per_sqm"] = round(apt["price_pln"] / apt["sqm"], 2)
 
-            time.sleep(random.uniform(1.0, 2.0))
+            time.sleep(random.uniform(0.8, 1.8))
         else:
             apt["description"] = None
         return apt
 
     def run(self, max_pages: int = 1) -> List[Dict[str, Any]]:
-        logger.info("Starting Morizon scraper for Warsaw...")
+        logger.info("Starting Freedom.pl scraper for Warsaw...")
         all_apartments: List[Dict[str, Any]] = []
 
         for page in range(1, max_pages + 1):
@@ -327,9 +308,9 @@ class MorizonScraper:
                 break
 
             total = len(apartments)
-            print(f"  [Morizon] Found {total} offers on page {page}. Fetching details safely...")
+            print(f"  [Freedom] Found {total} offers on page {page}. Fetching details safely...")
 
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            with ThreadPoolExecutor(max_workers=3) as executor:
                 futures = [
                     executor.submit(self._fetch_details_worker, apt, i + 1, total)
                     for i, apt in enumerate(apartments)
@@ -338,7 +319,7 @@ class MorizonScraper:
                     try:
                         all_apartments.append(future.result())
                     except Exception as e:
-                        logger.error("Error processing Morizon offer: %s", str(e))
+                        logger.error("Error processing Freedom offer: %s", str(e))
 
-        logger.info("Morizon scraping complete. Total: %d", len(all_apartments))
+        logger.info("Freedom scraping complete. Total: %d", len(all_apartments))
         return all_apartments

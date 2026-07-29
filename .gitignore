@@ -2,6 +2,14 @@
 .env
 .env.*
 
+# Credentials & secrets
+credentials.json
+*.json_token
+token.json
+
+# Cache
+.cache/
+
 # Python cache files
 __pycache__/
 *.py[cod]
