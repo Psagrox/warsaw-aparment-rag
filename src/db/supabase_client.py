@@ -150,6 +150,10 @@ class SupabaseApartmentClient:
                         except ValueError:
                             pass
 
+                # Calculate price_per_sqm if missing
+                if not record.get("price_per_sqm") and record.get("price_pln") and record.get("sqm") and record["sqm"] > 0:
+                    record["price_per_sqm"] = round(record["price_pln"] / record["sqm"], 2)
+
                 # Reasonable default fallbacks so PostgreSQL hard caps don't drop rows
                 if record.get("sqm") is None:
                     record["sqm"] = 42.0

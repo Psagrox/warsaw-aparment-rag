@@ -10,6 +10,7 @@ import src.config
 from src.db.supabase_client import SupabaseApartmentClient
 from src.scraper import (
     AdresowoScraper,
+    MorizonScraper,
     NieruchomosciOnlineScraper,
     OlxScraper,
     OtodomScraper,
@@ -42,7 +43,7 @@ def main() -> None:
         "--exclude",
         type=str,
         nargs="+",
-        help="Exclude specific portal scraper(s) e.g. --exclude nieruchomosci-online (or --exclude no)"
+        help="Exclude specific portal scraper(s) e.g. --exclude morizon (or --exclude no)"
     )
     args, _ = parser.parse_known_args()
 
@@ -54,6 +55,7 @@ def main() -> None:
         ("OLX", OlxScraper()),
         ("Adresowo", AdresowoScraper()),
         ("Nieruchomości-online", NieruchomosciOnlineScraper()),
+        ("Morizon", MorizonScraper()),
     ]
 
     # Apply exclusion filter if requested
