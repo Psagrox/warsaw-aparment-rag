@@ -187,16 +187,17 @@ class GoogleSheetsExporter:
                 if clean_url:
                     existing_urls.add(clean_url)
 
+                ext_id = (apt.get("external_id") or "").lower()
                 portal = "Otodom"
-                if "olx.pl" in url:
+                if "olx.pl" in clean_url or ext_id.startswith("olx-"):
                     portal = "OLX"
-                elif "adresowo.pl" in url:
+                elif "adresowo.pl" in clean_url or ext_id.startswith("adresowo-"):
                     portal = "Adresowo"
-                elif "nieruchomosci-online.pl" in url:
+                elif "nieruchomosci-online.pl" in clean_url or ext_id.startswith("no-"):
                     portal = "Nieruchomości-online"
-                elif "morizon.pl" in url:
+                elif "morizon.pl" in clean_url or ext_id.startswith("morizon-"):
                     portal = "Morizon"
-                elif "freedom.pl" in url:
+                elif "freedom.pl" in clean_url or ext_id.startswith("freedom-"):
                     portal = "Freedom"
 
                 district, date_str = extract_clean_district_and_date(apt)

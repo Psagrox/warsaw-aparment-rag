@@ -369,17 +369,19 @@ def generate_markdown_table(
     md += "|---|---|---|---|---|---|---|---|---|---|\n"
 
     for idx, apt in enumerate(apartments, start=start_index):
-        url = apt.get("url", "#")
+        ext_id = (apt.get("external_id") or "").lower()
+        url = (apt.get("url") or "").lower()
+
         portal = "Otodom"
-        if "olx.pl" in url:
+        if "olx.pl" in url or ext_id.startswith("olx-"):
             portal = "OLX"
-        elif "adresowo.pl" in url:
+        elif "adresowo.pl" in url or ext_id.startswith("adresowo-"):
             portal = "Adresowo"
-        elif "nieruchomosci-online.pl" in url:
+        elif "nieruchomosci-online.pl" in url or ext_id.startswith("no-"):
             portal = "Nieruchomości-online"
-        elif "morizon.pl" in url:
+        elif "morizon.pl" in url or ext_id.startswith("morizon-"):
             portal = "Morizon"
-        elif "freedom.pl" in url:
+        elif "freedom.pl" in url or ext_id.startswith("freedom-"):
             portal = "Freedom"
 
         district, date_str = extract_clean_district_and_date(apt)
