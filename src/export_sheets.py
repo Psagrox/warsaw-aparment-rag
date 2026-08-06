@@ -75,12 +75,15 @@ def extract_clean_district_and_date(apt: Dict[str, Any]) -> Tuple[str, str]:
     raw_date = apt.get("date_posted") or apt.get("date") or ""
 
     clean_district = district_raw
-    if "-" in district_raw:
-        parts = district_raw.split("-", 1)
-        if re.search(r"(\d{1,2}\s+[a-zA-ZzłóśćążęńZŁÓŚĆĄŻĘŃ]+\s+\d{4}|\d{1,2}\.\d{1,2}\.\d{4})", parts[1]):
-            clean_district = parts[0].strip()
-            if not raw_date or raw_date == "N/A":
-                raw_date = parts[1].strip()
+    date_match = re.search(
+        r"\s*-\s*(\d{1,2}\s+[a-zA-ZzłóśćążęńZŁÓŚĆĄŻĘŃ]+\s+\d{4}|\d{1,2}\.\d{1,2}\.\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}\s+[a-zA-ZzłóśćążęńZŁÓŚĆĄŻĘŃ]+)$",
+        district_raw,
+        re.IGNORECASE,
+    )
+    if date_match:
+        clean_district = district_raw[:date_match.start()].strip()
+        if not raw_date or raw_date == "N/A":
+            raw_date = date_match.group(1).strip()
 
     if not raw_date or raw_date == "N/A":
         raw_date = apt.get("created_at") or apt.get("updated_at") or ""

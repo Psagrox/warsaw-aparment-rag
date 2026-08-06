@@ -4,8 +4,17 @@ import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup
+
+try:
+    from curl_cffi import requests as curl_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    curl_requests = None
+    HAS_CURL_CFFI = False
+
 import httpx
 
 logger = logging.getLogger(__name__)
@@ -14,12 +23,67 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36 Edg/122.0.0.0",
 ]
+
+MONTH_MAP = {
+    "stycznia": "01", "stycznie": "01", "styczeń": "01", "sty": "01",
+    "lutego": "02", "luty": "02", "lut": "02",
+    "marca": "03", "marzec": "03", "mar": "03",
+    "kwietnia": "04", "kwiecień": "04", "kwi": "04",
+    "maja": "05", "maj": "05",
+    "czerwca": "06", "czerwiec": "06", "cze": "06",
+    "lipca": "07", "lipiec": "07", "lip": "07",
+    "sierpnia": "08", "sierpień": "08", "sie": "08",
+    "września": "09", "wrzesień": "09", "wrz": "09",
+    "października": "10", "październik": "10", "paź": "10",
+    "listopada": "11", "listopad": "11", "lis": "11",
+    "grudnia": "12", "grudzień": "12", "gru": "12",
+}
+
+
+def parse_date_to_iso(raw: str) -> Optional[str]:
+    """Converts various date strings into YYYY-MM-DD format."""
+    if not raw or raw == "N/A":
+        return None
+
+    raw_clean = raw.strip()
+
+    # ISO format YYYY-MM-DD
+    iso_match = re.search(r"(\d{4})-(\d{2})-(\d{2})", raw_clean)
+    if iso_match:
+        return f"{iso_match.group(1)}-{iso_match.group(2)}-{iso_match.group(3)}"
+
+    # DD.MM.YYYY
+    dot_match = re.search(r"(\d{1,2})\.(\d{1,2})\.(\d{4})", raw_clean)
+    if dot_match:
+        d, m, y = dot_match.group(1).zfill(2), dot_match.group(2).zfill(2), dot_match.group(3)
+        return f"{y}-{m}-{d}"
+
+    # "Dzisiaj" / "Today"
+    if "dzisiaj" in raw_clean.lower() or "today" in raw_clean.lower():
+        return datetime.now().strftime("%Y-%m-%d")
+
+    # "Wczoraj" / "Yesterday"
+    if "wczoraj" in raw_clean.lower() or "yesterday" in raw_clean.lower():
+        return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # Polish text date e.g. "02 sierpnia 2026"
+    text_match = re.search(r"(\d{1,2})\s+([a-zA-ZzłóśćążęńZŁÓŚĆĄŻĘŃ]+)(?:\s+(\d{4}))?", raw_clean)
+    if text_match:
+        day = text_match.group(1).zfill(2)
+        month_word = text_match.group(2).lower()
+        year = text_match.group(3) or str(datetime.now().year)
+        month_code = MONTH_MAP.get(month_word)
+        if month_code:
+            return f"{year}-{month_code}-{day}"
+
+    return None
 
 
 class NieruchomosciOnlineScraper:
-    """Scraper for Nieruchomosci-online.pl (Direct owners / bez pośredników in Warsaw)."""
+    """Scraper for Nieruchomosci-online.pl (Direct owners / bez pośredników in Warsaw).
+    Uses strict rate throttling and polite delays to prevent rate blocks.
+    """
 
     def __init__(self) -> None:
         self.base_url: str = "https://www.nieruchomosci-online.pl"
@@ -28,25 +92,38 @@ class NieruchomosciOnlineScraper:
             "Accept-Language": "pl,en-US;q=0.7,en;q=0.3",
             "Referer": "https://www.google.com/",
         }
-        self.timeout = httpx.Timeout(10.0, connect=5.0)
 
-    def _get_with_backoff(self, url: str, retries: int = 3) -> Optional[httpx.Response]:
-        """Fetch URL with exponential backoff on HTTP 429 (Rate Limit) or connection errors."""
+    def _get_with_backoff(self, url: str, retries: int = 3) -> Optional[Any]:
+        """Fetch URL using curl_cffi or httpx with exponential backoff and polite delay."""
+        if HAS_CURL_CFFI:
+            for attempt in range(1, retries + 1):
+                try:
+                    res = curl_requests.get(url, impersonate="chrome", timeout=12)
+                    if res.status_code == 200:
+                        return res
+                    if res.status_code in [429, 403]:
+                        wait_time = random.uniform(4.0, 8.0) * attempt
+                        print(f"⚠️ [Nieruchomości-online] HTTP {res.status_code}. Throttling {wait_time:.1f}s (Attempt {attempt}/{retries})...")
+                        time.sleep(wait_time)
+                except Exception as e:
+                    logger.debug("curl_cffi attempt %d failed for %s: %s", attempt, url, str(e))
+                    time.sleep(2.0)
+            return None
+
         for attempt in range(1, retries + 1):
             headers = self.headers.copy()
             headers["User-Agent"] = random.choice(USER_AGENTS)
             try:
-                response = httpx.get(url, headers=headers, timeout=self.timeout, follow_redirects=True)
-                if response.status_code == 429:
-                    wait_time = random.uniform(3.5, 7.0) * attempt
-                    print(f"⚠️ [Nieruchomości-online] HTTP 429 (Rate Limit). Retrying in {wait_time:.1f}s (Attempt {attempt}/{retries})...")
+                res = httpx.get(url, headers=headers, timeout=10.0, follow_redirects=True)
+                if res.status_code == 200:
+                    return res
+                if res.status_code in [429, 403]:
+                    wait_time = random.uniform(4.0, 8.0) * attempt
+                    print(f"⚠️ [Nieruchomości-online] HTTP {res.status_code}. Throttling {wait_time:.1f}s (Attempt {attempt}/{retries})...")
                     time.sleep(wait_time)
-                    continue
-                return response
             except Exception as e:
-                logger.debug("Attempt %d failed for %s: %s", attempt, url, str(e))
-                if attempt < retries:
-                    time.sleep(random.uniform(2.0, 4.0))
+                logger.debug("httpx attempt %d failed for %s: %s", attempt, url, str(e))
+                time.sleep(2.0)
         return None
 
     def _parse_rooms(self, raw_rooms: Any) -> Optional[int]:
@@ -98,12 +175,11 @@ class NieruchomosciOnlineScraper:
         parts = [p.strip() for p in text.split(",")]
         for part in parts:
             if part.lower() not in ["warszawa", "mazowieckie"]:
-                return part
-        return parts[0] if parts else None
+                return part.title()
+        return parts[0].title() if parts else None
 
     def _extract_fallback_params(self, text: str) -> Dict[str, Any]:
-        """Extract missing sqm, rooms, or price from title/URL text."""
-        res: Dict[str, Any] = {"sqm": None, "rooms": None, "price_pln": None}
+        res: Dict[str, Any] = {"sqm": None, "rooms": None, "price_pln": None, "date_posted": None}
         if not text:
             return res
 
@@ -132,6 +208,10 @@ class NieruchomosciOnlineScraper:
             except ValueError:
                 pass
 
+        date_match = re.search(r"(?:Dodano|Dodany|Data dodania|Zaktualizowano)\s*:?\s*(\d{1,2}\s+[a-zA-ZzłóśćążęńZŁÓŚĆĄŻĘŃ]+(?:\s+\d{4})?|\d{1,2}\.\d{1,2}\.\d{4}|dzisiaj|wczoraj)", text, re.IGNORECASE)
+        if date_match:
+            res["date_posted"] = parse_date_to_iso(date_match.group(1))
+
         return res
 
     def get_search_results(self, page: int = 1) -> List[Dict[str, Any]]:
@@ -150,113 +230,119 @@ class NieruchomosciOnlineScraper:
         apartments: List[Dict[str, Any]] = []
         seen_urls: set[str] = set()
 
-        cards = (
-            soup.find_all("div", class_=lambda c: c and "tile-content" in c.lower() if c else False)
-            or soup.find_all("div", class_=lambda c: c and "offer" in c.lower() if c else False)
-            or soup.select("div.primary-title, div[data-id]")
-        )
+        items = soup.select("div.tertiary") or soup.select("div.tertiary__box") or soup.select("div.tile-holder")
 
-        for card in cards:
-            link = card.find("a", href=True)
-            if not link:
+        for it in items:
+            link = it.find("a", href=True)
+            if not link or not link.get("href"):
                 continue
 
-            offer_url = link["href"]
-            if not offer_url.startswith("http"):
-                offer_url = f"{self.base_url}{offer_url}" if offer_url.startswith("/") else f"https://warszawa.nieruchomosci-online.pl/{offer_url}"
+            raw_href = link["href"]
+            if not raw_href.startswith("http"):
+                offer_url = f"https:{raw_href}" if raw_href.startswith("//") else f"https://warszawa.nieruchomosci-online.pl{raw_href}"
+            else:
+                offer_url = raw_href
 
-            # Deduplicate by canonical URL
             clean_url = offer_url.split("?")[0]
             if clean_url in seen_urls:
                 continue
             seen_urls.add(clean_url)
 
-            # Canonical offer ID from URL number e.g. /26780870.html -> 26780870
-            id_match = re.search(r"[/,]-?(\d{6,10})\.html", offer_url) or re.search(r"(\d{6,10})", offer_url)
+            # Canonical offer ID e.g. /26805920.html -> 26805920
+            id_match = re.search(r"/(\d{6,10})\.html", clean_url) or re.search(r"(\d{6,10})", clean_url)
             offer_id = id_match.group(1) if id_match else str(hash(clean_url))[:8]
 
-            title = link.get_text(strip=True) or (card.find("h2").get_text(strip=True) if card.find("h2") else None)
+            title = link.get_text(strip=True)
+
+            prov = it.find("p", class_=lambda c: c and "province" in c if c else False)
+            district = prov.find("a").get_text(strip=True).rstrip(",") if prov and prov.find("a") else None
 
             price_elem = (
-                card.find("span", class_=lambda c: c and "price" in c.lower() if c else False)
-                or card.find("p", class_=lambda c: c and "price" in c.lower() if c else False)
-                or card.find("div", class_=lambda c: c and "price" in c.lower() if c else False)
+                it.find("p", class_=lambda c: c and "primary-display" in c if c else False)
+                or it.find("span", class_=lambda c: c and "price" in c.lower() if c else False)
             )
-            price_val = self._parse_number(price_elem.get_text(strip=True)) if price_elem else None
+            price_txt = price_elem.get_text(strip=True) if price_elem else ""
+            p_match = re.search(r"(\d[\d\s\xa0\.]*)\s*zł", price_txt)
+            price_val = float(p_match.group(1).replace(" ", "").replace("\xa0", "").replace(".", "")) if p_match else None
 
-            info_elem = card.find("div", class_=lambda c: c and "info" in c.lower() if c else False) or card
-            info_text = info_elem.get_text() if info_elem else ""
+            area_elem = it.find("span", class_=lambda c: c and "area" in c if c else False)
+            area_txt = area_elem.get_text(strip=True) if area_elem else ""
+            s_match = re.search(r"(\d+(?:[\.,]\d+)?)", area_txt)
+            sqm_val = float(s_match.group(1).replace(",", ".")) if s_match else None
 
-            sqm_match = re.search(r"(\d+(?:[\.,]\d+)?)\s*m²", info_text)
-            sqm_val = self._parse_number(sqm_match.group(1)) if sqm_match else None
-
-            price_sqm_match = re.search(r"(\d+(?:\s*\d+)?)\s*zł/m²", info_text)
-            price_per_sqm = self._parse_number(price_sqm_match.group(1)) if price_sqm_match else None
-
-            rooms_match = re.search(r"(\d+)\s*pok", info_text, re.IGNORECASE)
-            rooms_val = self._parse_rooms(rooms_match.group(1)) if rooms_match else None
-
-            location_elem = card.find("span", class_=lambda c: c and ("location" in c.lower() or "address" in c.lower()) if c else False)
-            district = self._extract_district(location_elem.get_text(strip=True)) if location_elem else None
-
-            card_full_text = card.get_text(" ", strip=True) + " " + offer_url
-            fallbacks = self._extract_fallback_params(card_full_text)
+            info_text = it.get_text(" ", strip=True) + " " + clean_url
+            fallbacks = self._extract_fallback_params(info_text)
 
             price_val = price_val or fallbacks["price_pln"]
             sqm_val = sqm_val or fallbacks["sqm"]
-            rooms_val = rooms_val or fallbacks["rooms"]
+            rooms_val = fallbacks["rooms"]
+            date_posted = fallbacks.get("date_posted")
 
-            if not price_per_sqm and price_val and sqm_val and sqm_val > 0:
+            district_name = district or self._extract_district(info_text) or "Warszawa"
+            stored_district = f"{district_name} - {date_posted}" if date_posted and district_name else district_name
+
+            price_per_sqm = None
+            if price_val and sqm_val and sqm_val > 0:
                 price_per_sqm = round(price_val / sqm_val, 2)
-
-            if not title:
-                title = f"Mieszkanie na sprzedaż ({district or 'Warszawa'})"
 
             apartments.append({
                 "external_id": f"no-{offer_id}",
-                "title": title,
+                "title": title or f"Mieszkanie na sprzedaż ({district_name})",
                 "price_pln": price_val,
                 "price_per_sqm": price_per_sqm,
                 "sqm": sqm_val,
                 "rooms": rooms_val,
-                "district": district,
-                "url": offer_url,
+                "district": stored_district,
+                "date_posted": date_posted,
+                "url": clean_url,
             })
 
         return apartments
 
-    def get_full_description(self, url: str) -> Optional[str]:
+    def get_full_description(self, url: str) -> Tuple[Optional[str], Dict[str, Any]]:
         response = self._get_with_backoff(url)
+        meta: Dict[str, Any] = {}
         if not response or response.status_code != 200:
-            return None
+            return None, meta
 
         try:
             soup = BeautifulSoup(response.text, "html.parser")
+            page_text = soup.get_text(" ", strip=True)
+            meta = self._extract_fallback_params(page_text)
+
             desc_div = (
                 soup.find("div", class_=lambda c: c and "box-description" in c if c else False)
                 or soup.find("div", class_=lambda c: c and "offer-description" in c if c else False)
                 or soup.find("div", id="description")
                 or soup.find("div", class_=lambda c: c and "description" in c.lower() if c else False)
             )
-            return desc_div.get_text(separator="\n", strip=True) if desc_div else None
+            desc_text = desc_div.get_text(separator="\n", strip=True) if desc_div else None
+            return desc_text, meta
         except Exception:
-            return None
+            return None, meta
 
     def _fetch_details_worker(self, apt: Dict[str, Any], idx: int, total: int) -> Dict[str, Any]:
         url = apt.get("url", "")
         if url:
-            print(f"  [Nieruchomości-online] ({idx}/{total}) Fetching details...")
-            apt["description"] = self.get_full_description(url)
+            print(f"  [Nieruchomości-online] ({idx}/{total}) Fetching details safely...")
+            desc_text, meta = self.get_full_description(url)
+            apt["description"] = desc_text
 
-            if apt["description"]:
-                extra = self._extract_fallback_params(apt["description"])
-                apt["sqm"] = apt["sqm"] or extra["sqm"]
-                apt["rooms"] = apt["rooms"] or extra["rooms"]
-                apt["price_pln"] = apt["price_pln"] or extra["price_pln"]
-                if not apt["price_per_sqm"] and apt["price_pln"] and apt["sqm"]:
-                    apt["price_per_sqm"] = round(apt["price_pln"] / apt["sqm"], 2)
+            apt["sqm"] = apt["sqm"] or meta.get("sqm")
+            apt["rooms"] = apt["rooms"] or meta.get("rooms")
+            apt["price_pln"] = apt["price_pln"] or meta.get("price_pln")
+            date_posted = apt.get("date_posted") or meta.get("date_posted")
 
-            time.sleep(random.uniform(1.2, 2.5))
+            district_raw = apt.get("district") or "Warszawa"
+            if date_posted and "-" not in district_raw:
+                apt["district"] = f"{district_raw} - {date_posted}"
+            apt["date_posted"] = date_posted
+
+            if not apt["price_per_sqm"] and apt["price_pln"] and apt["sqm"]:
+                apt["price_per_sqm"] = round(apt["price_pln"] / apt["sqm"], 2)
+
+            # Strict polite rate limit delay between requests
+            time.sleep(random.uniform(2.5, 4.5))
         else:
             apt["description"] = None
         return apt
@@ -271,9 +357,10 @@ class NieruchomosciOnlineScraper:
                 break
 
             total = len(apartments)
-            print(f"  [Nieruchomości-online] Found {total} offers on page {page}. Fetching details safely...")
+            print(f"  [Nieruchomości-online] Found {total} offers on page {page}. Fetching details with rate-limiting delays...")
 
-            with ThreadPoolExecutor(max_workers=2) as executor:
+            # Single thread execution (max_workers=1) for strict throttling
+            with ThreadPoolExecutor(max_workers=1) as executor:
                 futures = [
                     executor.submit(self._fetch_details_worker, apt, i + 1, total)
                     for i, apt in enumerate(apartments)
@@ -283,6 +370,10 @@ class NieruchomosciOnlineScraper:
                         all_apartments.append(future.result())
                     except Exception as e:
                         logger.error("Error processing Nieruchomosci-online offer: %s", str(e))
+
+            # Delay between pages
+            if page < max_pages:
+                time.sleep(random.uniform(3.0, 5.0))
 
         logger.info("Nieruchomosci-online scraping complete. Total: %d", len(all_apartments))
         return all_apartments
