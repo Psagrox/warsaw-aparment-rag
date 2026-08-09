@@ -292,6 +292,9 @@ def search_ideal_apartments(
             portal_key = "morizon"
         elif "freedom.pl" in url or ext_id.startswith("freedom-"):
             portal_key = "freedom"
+        elif "facebook.com" in url or ext_id.startswith("fb-"):
+            portal_key = "facebook"
+
 
         # Portal exclusion filter
         if exclude_portals:

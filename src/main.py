@@ -13,6 +13,7 @@ import src.config
 from src.db.supabase_client import SupabaseApartmentClient
 from src.scraper import (
     AdresowoScraper,
+    FacebookScraper,
     FreedomScraper,
     MorizonScraper,
     NieruchomosciOnlineScraper,
@@ -47,13 +48,13 @@ def main() -> None:
         "--exclude",
         type=str,
         nargs="+",
-        help="Exclude specific portal scraper(s) e.g. --exclude morizon freedom"
+        help="Exclude specific portal scraper(s) e.g. --exclude morizon freedom facebook"
     )
     parser.add_argument(
         "--portals",
         type=str,
         nargs="+",
-        help="Only search specific portal(s) e.g. --portals otodom freedom"
+        help="Only search specific portal(s) e.g. --portals otodom freedom facebook"
     )
     args, _ = parser.parse_known_args()
 
@@ -67,6 +68,7 @@ def main() -> None:
         ("Nieruchomości-online", NieruchomosciOnlineScraper()),
         ("Morizon", MorizonScraper()),
         ("Freedom", FreedomScraper()),
+        ("Facebook", FacebookScraper()),
     ]
 
     # Apply portal inclusion filter if requested

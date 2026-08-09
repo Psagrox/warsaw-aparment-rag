@@ -24,3 +24,5 @@ def _get_required_env_var(var_name: str) -> str:
 SUPABASE_URL: str = _get_required_env_var("SUPABASE_URL")
 SUPABASE_KEY: str = _get_required_env_var("SUPABASE_KEY")
 OPENAI_API_KEY: str = _get_required_env_var("OPENAI_API_KEY")
+APIFY_API_TOKEN: str = os.getenv("APIFY_API_TOKEN", "").strip()
+

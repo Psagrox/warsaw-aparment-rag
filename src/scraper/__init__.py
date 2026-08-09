@@ -1,4 +1,5 @@
 from src.scraper.adresowo import AdresowoScraper
+from src.scraper.facebook import FacebookScraper
 from src.scraper.freedom import FreedomScraper
 from src.scraper.morizon import MorizonScraper
 from src.scraper.nieruchomosci_online import NieruchomosciOnlineScraper
@@ -12,4 +13,6 @@ __all__ = [
     "NieruchomosciOnlineScraper",
     "MorizonScraper",
     "FreedomScraper",
+    "FacebookScraper",
 ]
+

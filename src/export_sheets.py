@@ -202,6 +202,9 @@ class GoogleSheetsExporter:
                     portal = "Morizon"
                 elif "freedom.pl" in clean_url or ext_id.startswith("freedom-"):
                     portal = "Freedom"
+                elif "facebook.com" in clean_url or ext_id.startswith("fb-"):
+                    portal = "Facebook"
+
 
                 district, date_str = extract_clean_district_and_date(apt)
 
